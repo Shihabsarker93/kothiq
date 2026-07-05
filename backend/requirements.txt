@@ -6,3 +6,10 @@ requests
 openai
 google-genai
 google-cloud-texttospeech
+
+# Needed only for ASR_PROVIDER=local / TTS_PROVIDER=local (free, self-hosted,
+# runs directly in this process instead of calling a paid API or a Colab server)
+faster-whisper
+transformers
+torch
+soundfile
