@@ -1,0 +1,6 @@
+.env
+service-account.json
+backend/venv/
+__pycache__/
+*.pyc
+.claude/settings.local.json
