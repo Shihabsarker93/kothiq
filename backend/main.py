@@ -40,6 +40,7 @@ STAGE_TIMEOUT_SECONDS = 45
 
 @app.get("/health")
 def health():
+    """Simple health check endpoint to verify the backend is running."""
     return {"status": "ok"}
 
 
