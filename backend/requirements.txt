@@ -13,3 +13,6 @@ faster-whisper
 transformers
 torch
 soundfile
+
+# Needed only for ASR_PROVIDER=mlx (Apple Silicon GPU-accelerated Whisper, Macs only)
+mlx-whisper

@@ -9,54 +9,114 @@
     font-size: 18px; padding: 14px 28px; border-radius: 999px; border: none;
     cursor: pointer; color: white; background: #2563eb;
   }
-  button.recording { background: #dc2626; }
+  button.active { background: #16a34a; }
   button:disabled { background: #9ca3af; cursor: not-allowed; }
   .turn { margin: 16px 0; padding: 12px 16px; border-radius: 12px; }
   .turn.user { background: #eff6ff; }
   .turn.model { background: #f0fdf4; }
-  .status { color: #6b7280; font-size: 14px; margin-top: 8px; }
+  .status { color: #6b7280; font-size: 14px; margin-top: 8px; min-height: 20px; }
+  .status.recording { color: #dc2626; font-weight: 600; }
 </style>
 </head>
 <body>
   <h2>Kothiq — কথা বলুন</h2>
-  <p>বাটন চেপে বাংলা বা বাংলিশে কথা বলুন, ছেড়ে দিলে উত্তর শুনতে পাবেন।</p>
-  <button id="recordBtn">🎙️ Hold to talk</button>
+  <p>বাটনে চেপে কথোপকথন শুরু করুন, তারপর স্বাভাবিকভাবে বাংলা বা বাংলিশে কথা বলুন —
+     থামলে নিজে থেকেই বুঝে উত্তর দেবে, বাটন চেপে ধরে রাখতে হবে না।</p>
+  <button id="toggleBtn">🎙️ কথোপকথন শুরু করুন</button>
   <div class="status" id="status"></div>
   <div id="log"></div>
 
   <script>
     const sessionId = crypto.randomUUID();
-    const recordBtn = document.getElementById("recordBtn");
+    const toggleBtn = document.getElementById("toggleBtn");
     const statusEl = document.getElementById("status");
     const logEl = document.getElementById("log");
 
-    let mediaRecorder;
-    let chunks = [];
+    // Voice-activity detection tuning. Adjust if it's too trigger-happy on
+    // background noise (raise SPEECH_THRESHOLD) or cuts you off mid-sentence
+    // (raise SILENCE_MS).
+    const SPEECH_THRESHOLD = 0.03; // RMS level above which we call it "speaking"
+    const SILENCE_MS = 900; // pause length that ends an utterance
+    const MIN_SPEECH_MS = 250; // ignore blips shorter than this
+    const MAX_RECORDING_MS = 20000; // hard cap per utterance
 
-    async function startRecording() {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      mediaRecorder = new MediaRecorder(stream);
+    let state = "idle"; // idle -> listening -> recording -> processing -> speaking -> listening ...
+    let generation = 0; // bumped on stop, so stale in-flight turns don't reactivate the UI
+
+    let micStream, audioContext, analyser, dataArray, tickTimer;
+    let mediaRecorder, chunks, speechStartedAt, silenceStartedAt;
+
+    function rms() {
+      analyser.getByteTimeDomainData(dataArray);
+      let sumSquares = 0;
+      for (let i = 0; i < dataArray.length; i++) {
+        const normalized = (dataArray[i] - 128) / 128;
+        sumSquares += normalized * normalized;
+      }
+      return Math.sqrt(sumSquares / dataArray.length);
+    }
+
+    function setState(next, myGen) {
+      if (myGen !== undefined && myGen !== generation) return; // stale turn, ignore
+      state = next;
+      const labels = {
+        idle: "",
+        listening: "শুনছি... (কথা বলুন)",
+        recording: "রেকর্ড হচ্ছে...",
+        processing: "ভাবছি...",
+        speaking: "উত্তর দিচ্ছে...",
+      };
+      statusEl.textContent = labels[next] || "";
+      statusEl.className = "status" + (next === "recording" ? " recording" : "");
+    }
+
+    function tick() {
+      if (state !== "listening" && state !== "recording") return;
+      const level = rms();
+      const now = performance.now();
+
+      if (state === "listening") {
+        if (level > SPEECH_THRESHOLD) beginRecording(now);
+        return;
+      }
+
+      // state === "recording"
+      if (level > SPEECH_THRESHOLD) {
+        silenceStartedAt = null;
+      } else {
+        if (silenceStartedAt === null) silenceStartedAt = now;
+        const silentFor = now - silenceStartedAt;
+        const spokenFor = now - speechStartedAt;
+        if (silentFor > SILENCE_MS && spokenFor > MIN_SPEECH_MS) {
+          endRecordingAndSend();
+          return;
+        }
+      }
+      if (now - speechStartedAt > MAX_RECORDING_MS) {
+        endRecordingAndSend();
+      }
+    }
+
+    function beginRecording(now) {
       chunks = [];
+      mediaRecorder = new MediaRecorder(micStream);
       mediaRecorder.ondataavailable = (e) => chunks.push(e.data);
-      mediaRecorder.onstop = onRecordingStop;
       mediaRecorder.start();
-      recordBtn.classList.add("recording");
-      recordBtn.textContent = "🔴 Release to send";
-      statusEl.textContent = "শুনছি...";
+      speechStartedAt = now;
+      silenceStartedAt = null;
+      setState("recording");
     }
 
-    function stopRecording() {
-      mediaRecorder?.stop();
-      mediaRecorder?.stream.getTracks().forEach((t) => t.stop());
-      recordBtn.classList.remove("recording");
-      recordBtn.textContent = "🎙️ Hold to talk";
-    }
+    async function endRecordingAndSend() {
+      const myGen = generation;
+      setState("processing", myGen);
 
-    async function onRecordingStop() {
+      const stopped = new Promise((resolve) => (mediaRecorder.onstop = resolve));
+      mediaRecorder.stop();
+      await stopped;
+      if (myGen !== generation) return;
+
       const blob = new Blob(chunks, { type: "audio/webm" });
-      recordBtn.disabled = true;
-      statusEl.textContent = "ভাবছি...";
-
       const form = new FormData();
       form.append("session_id", sessionId);
       form.append("audio", blob, "utterance.webm");
@@ -64,23 +124,54 @@
       try {
         const res = await fetch("/api/converse", { method: "POST", body: form });
         const data = await res.json();
+        if (myGen !== generation) return;
 
         if (!res.ok) {
           statusEl.textContent = "সমস্যা হয়েছে: " + (data.error || res.status);
+          setState("listening", myGen);
           return;
         }
 
         addTurn("user", data.transcript);
         addTurn("model", data.reply_text);
 
+        setState("speaking", myGen);
         const audio = new Audio("data:" + data.audio_mime + ";base64," + data.audio_base64);
-        statusEl.textContent = "";
+        audio.onended = () => setState("listening", myGen);
         await audio.play();
       } catch (err) {
+        if (myGen !== generation) return;
         statusEl.textContent = "নেটওয়ার্ক সমস্যা: " + err;
-      } finally {
-        recordBtn.disabled = false;
+        setState("listening", myGen);
       }
+    }
+
+    async function startConversation() {
+      micStream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+      audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      const source = audioContext.createMediaStreamSource(micStream);
+      analyser = audioContext.createAnalyser();
+      analyser.fftSize = 2048;
+      dataArray = new Uint8Array(analyser.fftSize);
+      source.connect(analyser);
+
+      tickTimer = setInterval(tick, 100);
+      setState("listening");
+      toggleBtn.textContent = "⏹️ কথোপকথন শেষ করুন";
+      toggleBtn.classList.add("active");
+    }
+
+    function stopConversation() {
+      generation++; // invalidate any in-flight turn
+      clearInterval(tickTimer);
+      if (mediaRecorder && mediaRecorder.state !== "inactive") mediaRecorder.stop();
+      micStream?.getTracks().forEach((t) => t.stop());
+      audioContext?.close();
+      setState("idle");
+      toggleBtn.textContent = "🎙️ কথোপকথন শুরু করুন";
+      toggleBtn.classList.remove("active");
     }
 
     function addTurn(role, text) {
@@ -90,10 +181,10 @@
       logEl.prepend(div);
     }
 
-    recordBtn.addEventListener("mousedown", startRecording);
-    recordBtn.addEventListener("mouseup", stopRecording);
-    recordBtn.addEventListener("touchstart", (e) => { e.preventDefault(); startRecording(); });
-    recordBtn.addEventListener("touchend", (e) => { e.preventDefault(); stopRecording(); });
+    toggleBtn.addEventListener("click", () => {
+      if (state === "idle") startConversation();
+      else stopConversation();
+    });
   </script>
 </body>
 </html>

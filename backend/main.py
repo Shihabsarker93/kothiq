@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import logging
 import os
@@ -32,6 +33,10 @@ app.add_middleware(
 MAX_HISTORY_TURNS = 12
 sessions: dict[str, list[dict]] = {}
 
+# Safety net so a stuck local ASR/TTS model gives the user a clear error
+# instead of the request hanging forever with no feedback.
+STAGE_TIMEOUT_SECONDS = 45
+
 
 @app.get("/health")
 def health():
@@ -41,9 +46,21 @@ def health():
 @app.post("/api/converse")
 async def converse(session_id: str = Form(...), audio: UploadFile = File(...)):
     audio_bytes = await audio.read()
+    logger.info(
+        "Received audio: %d bytes, content_type=%s, filename=%s, header=%r",
+        len(audio_bytes), audio.content_type, audio.filename, audio_bytes[:16],
+    )
 
     try:
-        transcript = asr.transcribe(audio_bytes, audio.filename or "audio.webm")
+        transcript = await asyncio.wait_for(
+            asyncio.to_thread(
+                asr.transcribe, audio_bytes, audio.filename or "audio.webm"
+            ),
+            timeout=STAGE_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        logger.error("ASR timed out after %ss", STAGE_TIMEOUT_SECONDS)
+        return JSONResponse({"error": "asr_timeout"}, status_code=504)
     except Exception:
         logger.exception("ASR failed")
         return JSONResponse({"error": "asr_failed"}, status_code=502)
@@ -54,7 +71,13 @@ async def converse(session_id: str = Form(...), audio: UploadFile = File(...)):
     history = sessions.get(session_id, [])
 
     try:
-        reply_text = llm.generate_reply(history, transcript)
+        reply_text = await asyncio.wait_for(
+            asyncio.to_thread(llm.generate_reply, history, transcript),
+            timeout=STAGE_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        logger.error("LLM timed out after %ss", STAGE_TIMEOUT_SECONDS)
+        return JSONResponse({"error": "llm_timeout"}, status_code=504)
     except Exception:
         logger.exception("LLM failed")
         return JSONResponse({"error": "llm_failed"}, status_code=502)
@@ -66,7 +89,13 @@ async def converse(session_id: str = Form(...), audio: UploadFile = File(...)):
     sessions[session_id] = history[-MAX_HISTORY_TURNS:]
 
     try:
-        audio_reply = tts.synthesize(reply_text)
+        audio_reply = await asyncio.wait_for(
+            asyncio.to_thread(tts.synthesize, reply_text),
+            timeout=STAGE_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        logger.error("TTS timed out after %ss", STAGE_TIMEOUT_SECONDS)
+        return JSONResponse({"error": "tts_timeout"}, status_code=504)
     except Exception:
         logger.exception("TTS failed")
         return JSONResponse({"error": "tts_failed"}, status_code=502)
